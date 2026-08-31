@@ -1,0 +1,314 @@
+name: auto-sync-upstream
+
+# Hardened automatic upstream mirror for this fork.
+# Goal: main always tracks MarSeventh/CloudFlare-ImgBed@main and never stays stale.
+#
+# Design choices:
+# 1) hard-reset to upstream/main (no merge conflicts)
+# 2) restore fork maintenance files after every reset
+# 3) use SYNC_UPSTREAM_TOKEN (needs workflow write) instead of GITHUB_TOKEN
+# 4) neutralize upstream's fragile Upstream Sync schedule after each mirror
+# 5) open/close a tracking issue on failure/success
+# 6) skip push when origin already matches the rebuilt tip
+
+on:
+  schedule:
+    # primary cadence
+    - cron: "0 */6 * * *"
+    # secondary safety net, offset from the 6h grid
+    - cron: "20 1 * * *"
+  workflow_dispatch:
+    inputs:
+      force_push:
+        description: "Force push even if commit tip already matches"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: auto-sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Ensure and validate sync token
+        id: token
+        env:
+          SYNC_UPSTREAM_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SYNC_UPSTREAM_TOKEN:-}" ]; then
+            {
+              echo "### Auto sync blocked"
+              echo "- reason: missing secret \`SYNC_UPSTREAM_TOKEN\`"
+              echo "- fix: create a classic PAT with \`repo\` + \`workflow\`, then:"
+              echo '  \`gh secret set SYNC_UPSTREAM_TOKEN --repo '"${GITHUB_REPOSITORY}"'\`'
+              echo "- note: default GITHUB_TOKEN cannot create/update workflow files"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Missing repository secret SYNC_UPSTREAM_TOKEN"
+            exit 1
+          fi
+
+          HDRS="$(mktemp)"
+          CODE="$(curl -sS -D "$HDRS" -o /tmp/token-probe.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${SYNC_UPSTREAM_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}")"
+
+          echo "token_http_code=${CODE}" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::SYNC_UPSTREAM_TOKEN cannot read ${GITHUB_REPOSITORY} (HTTP ${CODE}). Token expired/revoked or lacks repo access."
+            cat /tmp/token-probe.json || true
+            exit 1
+          fi
+
+          SCOPES="$(tr -d '\r' < "$HDRS" | awk -F': ' 'tolower($1)=="x-oauth-scopes"{print $2}')"
+          echo "token_scopes=${SCOPES}" >> "$GITHUB_OUTPUT"
+          if [ -n "$SCOPES" ]; then
+            echo "Detected classic token scopes: ${SCOPES}"
+            if ! printf '%s' "$SCOPES" | grep -qi 'workflow'; then
+              echo "::error::SYNC_UPSTREAM_TOKEN is missing the workflow scope. Auto-sync must update .github/workflows/*."
+              exit 1
+            fi
+            if ! printf '%s' "$SCOPES" | grep -qi 'repo'; then
+              echo "::error::SYNC_UPSTREAM_TOKEN is missing the repo scope."
+              exit 1
+            fi
+          else
+            echo "No X-OAuth-Scopes header (likely fine-grained token). Continuing with runtime push validation."
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+          persist-credentials: true
+
+      - name: Setup git identity and remotes
+        env:
+          SYNC_UPSTREAM_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "imgbed-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${SYNC_UPSTREAM_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/MarSeventh/CloudFlare-ImgBed.git
+
+          for i in 1 2 3 4 5; do
+            if git fetch upstream --tags --force && git fetch origin --force; then
+              break
+            fi
+            if [ "$i" -eq 5 ]; then
+              echo "::error::Failed to fetch upstream/origin after retries"
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+
+          test -n "$(git rev-parse --verify upstream/main)"
+          test -n "$(git rev-parse --verify origin/main)"
+
+      - name: Snapshot maintenance files
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/imgbed-maint
+          mkdir -p /tmp/imgbed-maint/.github/workflows
+          cp .github/workflows/auto-sync-upstream.yml /tmp/imgbed-maint/.github/workflows/auto-sync-upstream.yml
+          cp .github/workflows/sync-upstream.yml /tmp/imgbed-maint/.github/workflows/sync-upstream.yml
+          cp AUTO_SYNC.md /tmp/imgbed-maint/AUTO_SYNC.md
+
+      - name: Rebuild main from upstream
+        id: sync
+        env:
+          FORCE_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_push == true }}
+        run: |
+          set -euo pipefail
+
+          BEFORE="$(git rev-parse HEAD)"
+          ORIGIN_BEFORE="$(git rev-parse origin/main)"
+          UPSTREAM="$(git rev-parse upstream/main)"
+
+          {
+            echo "before=${BEFORE}"
+            echo "origin_before=${ORIGIN_BEFORE}"
+            echo "upstream=${UPSTREAM}"
+          } >> "$GITHUB_OUTPUT"
+
+          git checkout -B main
+          git reset --hard upstream/main
+
+          mkdir -p .github/workflows
+          cp /tmp/imgbed-maint/.github/workflows/auto-sync-upstream.yml .github/workflows/auto-sync-upstream.yml
+          cp /tmp/imgbed-maint/.github/workflows/sync-upstream.yml .github/workflows/sync-upstream.yml
+          cp /tmp/imgbed-maint/AUTO_SYNC.md AUTO_SYNC.md
+
+          if command -v sed >/dev/null 2>&1; then
+            sed -i 's/\r$//' \
+              .github/workflows/auto-sync-upstream.yml \
+              .github/workflows/sync-upstream.yml \
+              AUTO_SYNC.md || true
+          fi
+
+          git add \
+            .github/workflows/auto-sync-upstream.yml \
+            .github/workflows/sync-upstream.yml \
+            AUTO_SYNC.md
+
+          if git diff --cached --quiet; then
+            echo "maintenance already present on upstream tree"
+          else
+            git commit -m "chore(maint): keep auto-sync-upstream workflow"
+          fi
+
+          AFTER="$(git rev-parse HEAD)"
+          AFTER_TREE="$(git rev-parse 'HEAD^{tree}')"
+          ORIGIN_TREE="$(git rev-parse 'origin/main^{tree}')"
+          {
+            echo "after=${AFTER}"
+            echo "after_tree=${AFTER_TREE}"
+            echo "origin_tree=${ORIGIN_TREE}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Compare trees, not commit SHAs.
+          # Rebuilding always creates a fresh maint commit object even when file
+          # contents are identical; SHA-only comparison would force-push every run.
+          NEED_PUSH=false
+          if [ "${ORIGIN_TREE}" != "${AFTER_TREE}" ]; then
+            NEED_PUSH=true
+          fi
+          if [ "${FORCE_PUSH}" = "true" ]; then
+            NEED_PUSH=true
+          fi
+
+          if [ "${NEED_PUSH}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "Already mirrored: origin/main tree matches rebuilt tree (${AFTER_TREE})."
+            # Keep local tip aligned with origin for summary readability.
+            git reset --hard origin/main >/dev/null 2>&1 || true
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          push_with_retries() {
+            local mode="$1"
+            local n
+            for n in 1 2 3 4 5; do
+              if [ "$mode" = "lease" ]; then
+                if git push origin main --force-with-lease; then
+                  return 0
+                fi
+              else
+                if git push origin main --force; then
+                  return 0
+                fi
+              fi
+              echo "push mode=${mode} attempt=${n} failed"
+              sleep $((n * 3))
+            done
+            return 1
+          }
+
+          if push_with_retries lease || push_with_retries force; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Failed to push rebuilt main to origin after retries"
+            exit 1
+          fi
+
+      - name: Verify remote tip
+        if: steps.sync.outputs.pushed == 'true'
+        run: |
+          set -euo pipefail
+          git fetch origin --force
+          REMOTE="$(git rev-parse origin/main)"
+          EXPECTED="${{ steps.sync.outputs.after }}"
+          echo "remote=${REMOTE}"
+          echo "expected=${EXPECTED}"
+          if [ "${REMOTE}" != "${EXPECTED}" ]; then
+            echo "::error::origin/main (${REMOTE}) does not match expected tip (${EXPECTED})"
+            exit 1
+          fi
+
+      - name: Close sync failure issue on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE='[auto-sync] Upstream synchronization failed'
+          nums="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title ${TITLE}" --json number,title --jq '.[] | select(.title=="'"$TITLE"'") | .number' || true)"
+          for n in $nums; do
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "Automatic synchronization recovered successfully in run ${GITHUB_RUN_ID}. Closing this notice." || true
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed || true
+          done
+
+      - name: Open or update sync failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE='[auto-sync] Upstream synchronization failed'
+          BODY_FILE="$(mktemp)"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "## Auto sync failed"
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "Common causes:"
+            echo "1. \`SYNC_UPSTREAM_TOKEN\` missing / expired / revoked"
+            echo "2. Token lacks \`repo\` + \`workflow\` (classic) or Contents+Workflows write (fine-grained)"
+            echo "3. Temporary GitHub/network failure while fetching or pushing"
+            echo "4. Manual force-push race on \`main\`"
+            echo
+            echo "Fix checklist:"
+            echo "1. Recreate a durable classic PAT with \`repo\` + \`workflow\`"
+            echo "2. \`gh secret set SYNC_UPSTREAM_TOKEN --repo ${GITHUB_REPOSITORY}\`"
+            echo "3. Re-run **auto-sync-upstream** from Actions"
+            echo "4. Confirm latest run is green and \`main\` tracks upstream"
+            echo
+            echo "This issue is opened by the sync workflow and will auto-close after the next successful run."
+          } > "$BODY_FILE"
+
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title ${TITLE}" --json number,title --jq '.[] | select(.title=="'"$TITLE"'") | .number' | head -n1 || true)"
+          if [ -n "${existing}" ]; then
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE" || true
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still failing in run ${GITHUB_RUN_ID}: ${RUN_URL}" || true
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE" || true
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### CloudFlare-ImgBed auto sync"
+            echo "- upstream repo: MarSeventh/CloudFlare-ImgBed@main"
+            echo "- before: \`${{ steps.sync.outputs.before }}\`"
+            echo "- origin_before: \`${{ steps.sync.outputs.origin_before }}\`"
+            echo "- upstream: \`${{ steps.sync.outputs.upstream }}\`"
+            echo "- after: \`${{ steps.sync.outputs.after }}\`"
+            echo "- after_tree: \`${{ steps.sync.outputs.after_tree }}\`"
+            echo "- origin_tree: \`${{ steps.sync.outputs.origin_tree }}\`"
+            echo "- changed: \`${{ steps.sync.outputs.changed }}\`"
+            echo "- pushed: \`${{ steps.sync.outputs.pushed }}\`"
+            echo ""
+            echo "#### Recent commits"
+            git log --oneline -8 main || true
+          } >> "$GITHUB_STEP_SUMMARY"
